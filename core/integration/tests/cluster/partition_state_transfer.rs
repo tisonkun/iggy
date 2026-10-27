@@ -74,8 +74,9 @@ const KILL_GATE_POLL: Duration = Duration::from_millis(10);
 const CONVERSION_MARKER: &str = "partition repair floor unreachable; converting to state transfer";
 const INSTALL_MARKER: &str = "partition state transfer installed";
 const INSTALL_FAILED_MARKER: &str = "partition state transfer install failed";
-/// The `StaleTransfer` reason, logged inside an [`INSTALL_FAILED_MARKER`] line.
-const STALE_INSTALL_MARKER: &str = "is below the local commit frontier";
+/// The `OfferErasesHeldOps` reason, logged inside an [`INSTALL_FAILED_MARKER`]
+/// line.
+const HELD_OPS_INSTALL_MARKER: &str = "would erase held ops";
 /// Logged once per transfer, at the last byte of the last artifact. The
 /// descriptor-time "serving" line only proves a request ARRIVED; this proves the
 /// pull ran.
@@ -382,7 +383,6 @@ async fn given_transfer_peer_dies_when_stalled_should_leave_dead_peer_and_recove
 /// needed: the pull itself is a few KiB.
 #[tokio::test(flavor = "multi_thread")]
 #[parallel]
-#[ignore = "known bug: under sustained writes the backup refuses every transfer as stale (transfer frontier below the local commit frontier); run with --run-ignored only"]
 async fn given_sustained_writes_when_a_node_falls_past_the_evicted_ring_should_rejoin_through_one_transfer()
  {
     let mut harness = relayed_cluster();
@@ -408,12 +408,10 @@ async fn given_sustained_writes_when_a_node_falls_past_the_evicted_ring_should_r
         .expect("restore node 2's peer links");
     await_marker(&harness, LAGGING_NODE, CONVERSION_MARKER).await;
 
-    // Today every install is refused with "transfer frontier X is below the
-    // local commit frontier X+1". The first request only pins the offer at the
-    // primary's commit point (the build answers "flush is pending"), and the
-    // pull runs on the next request, one `repair_retry_interval` later. Node 2
-    // journals the op committed in between, and the install refuses an offer
-    // below an op it holds.
+    // The first request only pins the offer at the primary's commit point (the
+    // build answers "flush is pending"), and the pull runs on the next request,
+    // one `repair_retry_interval` later. Node 2 journals the ops committed in
+    // between, so it holds ops above the offer it installs.
     let deadline = Instant::now() + TRANSFER_BUDGET;
     while harness
         .node(LAGGING_NODE)
@@ -424,15 +422,15 @@ async fn given_sustained_writes_when_a_node_falls_past_the_evicted_ring_should_r
             Instant::now() < deadline,
             "node 2 fell past the evicted ring and never installed a state transfer within \
              {TRANSFER_BUDGET:?} while one message per second was written: the peers fully \
-             served {} pull(s) and node 2 failed {} install(s), {} of them as stale, so a \
-             backup cannot rejoin under sustained writes",
+             served {} pull(s) and node 2 failed {} install(s), {} of them for held ops, so \
+             a backup cannot rejoin under sustained writes",
             fully_served_count(&harness),
             harness
                 .node(LAGGING_NODE)
                 .stdout_occurrences(INSTALL_FAILED_MARKER),
             harness
                 .node(LAGGING_NODE)
-                .stdout_occurrences(STALE_INSTALL_MARKER),
+                .stdout_occurrences(HELD_OPS_INSTALL_MARKER),
         );
         sleep(MARKER_POLL).await;
     }

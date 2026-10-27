@@ -19,12 +19,11 @@
 //!
 //! Replica 2 is cut off for a moment, long enough to start a view change of its
 //! own, and every message it sends from then on takes longer than the
-//! view-change status timeout to arrive. Its `StartViewChange` for the next
-//! view therefore lands after it already timed out into the view after that.
-//! Replicas 0 and 1 are Normal and commit together, yet each such
-//! `StartViewChange` takes them out of their working view, and the primary
-//! keeps moving between them. Nothing but latency is injected after the cut
-//! heals: no packet is dropped.
+//! view-change status timeout to arrive. A replica that times out into the
+//! next view before its `StartViewChange` lands stays one view ahead of every
+//! vote it sends, and each vote that lands takes replicas 0 and 1 out of their
+//! working view while they commit together. Nothing but latency is injected
+//! after the cut heals: no packet is dropped.
 
 use server_common::sharding::IggyNamespace;
 
@@ -53,12 +52,11 @@ const CUT_TICKS: u64 = 600;
 const EGRESS_DELAY_TICKS: u64 = 520;
 /// Measured after the heal: 300 s of virtual time at 10 ms per tick.
 const MEASURE_TICKS: u64 = 30_000;
-/// The heal itself may cost a few view changes while replica 2 rejoins: 450
-/// ticks of delay costs up to 3 here, 520 ticks costs about 60.
+/// The heal itself may cost a few view changes while replica 2 rejoins: up to 2
+/// per group here with 450, 520 or 1200 ticks of delay.
 const VIEW_CHANGES_MAX: u32 = 5;
 
 #[test]
-#[ignore = "known bug: a replica slower than the view-change status timeout keeps the healthy pair leaving its working view; run with --ignored"]
 fn given_a_replica_slower_than_the_view_change_timeout_when_it_rejoins_should_not_keep_the_healthy_pair_changing_views()
  {
     let (mut sim, client) = cluster(SEED);

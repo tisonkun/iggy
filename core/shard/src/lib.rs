@@ -14660,12 +14660,11 @@ mod dvc_suffix_window_tests {
 #[cfg(test)]
 mod installed_transfer_dvc_tests {
     //! A lagging replica adopts a `StartView` and later installs a state
-    //! transfer below that view's head. The install rewinds the sequencer to
-    //! the transfer's op and keeps the adopted view. Each `DoViewChange` the
-    //! replica sends from then on carries the transfer op in its header but
-    //! starts its suffix at the adopted head, and its peers drop every one as
-    //! unreadable. With a third replica down, or back with an untrusted log,
-    //! no quorum of readable votes forms and the view change never ends.
+    //! transfer below that view's head. The install keeps that head, so each
+    //! `DoViewChange` the replica sends afterwards stays readable and
+    //! describes every uncommitted op of the adopted view. With a third
+    //! replica down, or back with an untrusted log, the view change has no
+    //! other quorum of readable votes.
 
     use super::*;
     use consensus::{LocalPipeline, dvc_suffix_decode};
@@ -14689,10 +14688,9 @@ mod installed_transfer_dvc_tests {
     const COMMIT: u64 = HEAD - 2;
 
     #[compio::test]
-    #[ignore = "known bug: a transfer installed below the adopted view head makes the replica's DoViewChange unreadable; run with --ignored"]
     async fn given_a_transfer_installed_below_the_adopted_head_when_a_view_change_follows_should_send_a_readable_do_view_change()
      {
-        // Inside the 128-entry window, so only the head disagrees.
+        // Inside the 128-entry window: only the header op can disagree with the suffix.
         let transfer = HEAD - 100;
         // Boxed: the setup future carries a whole partition.
         let (vote, message) = Box::pin(vote_after_install(transfer)).await;
@@ -14719,7 +14717,6 @@ mod installed_transfer_dvc_tests {
     }
 
     #[compio::test]
-    #[ignore = "known bug: a transfer installed far below the adopted view head leaves uncommitted ops outside the DoViewChange window; run with --ignored"]
     async fn given_a_transfer_installed_far_below_the_adopted_head_when_a_view_change_follows_should_describe_every_uncommitted_op()
      {
         // Past the 128-entry window.
@@ -14788,10 +14785,9 @@ mod installed_transfer_dvc_tests {
 
         // Repair finds the gap evicted at every peer, so a transfer follows. The
         // install cannot run here: its offsets artifact is a type private to
-        // `partitions`. So these are its journal wipe and then the steps of
-        // `publish_installed_consensus`, in its order, with a checkpoint prepare
-        // built here in place of the origin's. They rewind the sequencer to
-        // `transfer` and keep the adopted view.
+        // `partitions`. So these are its journal wipe and then the consensus step
+        // of `publish_installed_consensus`, with a checkpoint prepare built here in
+        // place of the origin's.
         let checkpoint = Message::<PrepareHeader>::new(size_of::<PrepareHeader>())
             .transmute_header(|_, header: &mut PrepareHeader| {
                 *header = prepare_header(transfer, 0);
@@ -14801,12 +14797,10 @@ mod installed_transfer_dvc_tests {
             transfer,
             Owned::<MESSAGE_ALIGN>::copy_from_slice(checkpoint.as_slice()).into(),
         );
-        let consensus = partition.consensus();
-        consensus.set_commit_floor(transfer);
-        consensus.sequencer().set_sequence(transfer);
-        consensus.set_last_prepare_checksum(checkpoint.header().checksum);
-        consensus.clear_pipeline();
-        consensus.advance_commit_max(transfer);
+        partition.consensus().note_journal_mutation();
+        partition
+            .consensus()
+            .install_checkpoint(transfer, Some(checkpoint.header().checksum));
 
         // `on_start_view_change`: snapshot the suffix, then vote.
         refresh_partition_dvc_suffix(&partition);

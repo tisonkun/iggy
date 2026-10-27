@@ -2076,11 +2076,17 @@ pub enum PartitionInstallError {
         kind: ConsumerKind,
     },
     /// `commit_op` fell below this replica's commit frontier; installing
-    /// would rewind `commit_min` (the anti-rewind assert, as a refusal) or
-    /// erase a committed op this replica holds.
+    /// would rewind `commit_min` (the anti-rewind assert, as a refusal).
     StaleTransfer {
         commit_op: u64,
         commit_min: u64,
+    },
+    /// The install wipes the journal, which holds an op above `commit_op` that
+    /// this replica may have acknowledged: one at or below `held_max`, its
+    /// accepted WAL head, or the known commit without a WAL.
+    OfferErasesHeldOps {
+        commit_op: u64,
+        held_max: u64,
     },
     /// The incoming frontier could not be made durable before the swap, so the
     /// install refuses rather than enter a window whose only durable witness
@@ -2170,6 +2176,14 @@ impl fmt::Display for PartitionInstallError {
             } => write!(
                 f,
                 "transfer frontier {commit_op} is below the local commit frontier {commit_min}"
+            ),
+            Self::OfferErasesHeldOps {
+                commit_op,
+                held_max,
+            } => write!(
+                f,
+                "transfer commit op {commit_op} would erase held ops up to {held_max} that \
+                 this replica may have acknowledged"
             ),
             Self::FrontierNotDurable { frontier } => write!(
                 f,
@@ -4160,6 +4174,7 @@ where
     fn clear_install_journal(&mut self) {
         self.log.journal().inner.clear_all();
         self.log.journal_mut().info = crate::log::JournalInfo::default();
+        self.consensus().note_journal_mutation();
     }
 
     /// Clear the offset table for the installed one, which keeps `emptied_at`.
@@ -4245,17 +4260,10 @@ where
                 install.commit_op,
                 Owned::<4096>::copy_from_slice(&install.offsets_wire.checkpoint_prepare).into(),
             );
+            self.consensus().note_journal_mutation();
         }
-        let consensus = self.consensus();
-        if install.commit_op > consensus.commit_min() {
-            consensus.set_commit_floor(install.commit_op);
-        }
-        consensus.sequencer().set_sequence(install.commit_op);
-        if let Some(checksum) = install.offsets_wire.prepare_checksum {
-            consensus.set_last_prepare_checksum(checksum);
-        }
-        consensus.clear_pipeline();
-        consensus.advance_commit_max(install.commit_op);
+        self.consensus()
+            .install_checkpoint(install.commit_op, install.offsets_wire.prepare_checksum);
         // The cleared journal and pipeline held any unapplied install, and the
         // checkpoint already carries every owner installed up to commit_op.
         self.pending_owner_install.set(None);
@@ -4316,25 +4324,24 @@ where
                 commit_min,
             });
         }
-        // The install wipes the journal and rewinds the sequencer to
-        // `commit_op`. The primary may have counted this replica's ack before
-        // its commit reached us. Acks wait for the contiguous WAL head, so
-        // protect held ops through that head as well as the known commit.
-        // Ops known only from heartbeats are not held: a transferring replica
-        // journals nothing, and repair fetches them after install. Refusing on
-        // `commit_max` alone would refuse every offer under steady writes:
-        // heartbeats carry the primary's `commit_min` past whatever op an offer
-        // pinned.
+        // The install wipes the journal. The primary may have counted this
+        // replica's ack before its commit reached us. Acks wait for the
+        // contiguous WAL head, so protect held ops through that head. Held ops
+        // above it were never acked, and repair fetches them again after
+        // install. Protecting them as well refuses every offer under steady
+        // writes: while the serving peer builds the offer, repair journals the
+        // committed tail past the op the offer pinned. Without a WAL nothing
+        // bounds the acks, so the known commit stands in.
         let commit_max = self.consensus().commit_max();
         let held_max = self
             .persistence
             .as_ref()
-            .map_or(commit_max, |persistence| persistence.head().max(commit_max));
+            .map_or(commit_max, |persistence| persistence.head());
         let journal = &self.log.journal().inner;
         if commit_op < held_max && journal.holds_op_in(commit_op + 1..=held_max) {
-            return Err(PartitionInstallError::StaleTransfer {
+            return Err(PartitionInstallError::OfferErasesHeldOps {
                 commit_op,
-                commit_min: held_max,
+                held_max,
             });
         }
         let offsets_wire = ConsumerOffsetsWire::decode(offsets_bytes)?;

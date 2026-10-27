@@ -14017,13 +14017,48 @@ mod tests {
             matches!(
                 refused,
                 Err(
-                    crate::state_transfer::PartitionInstallError::StaleTransfer {
+                    crate::state_transfer::PartitionInstallError::OfferErasesHeldOps {
                         commit_op: 1,
-                        commit_min: 3,
+                        held_max: 3,
                     }
                 )
             ),
-            "expected a stale refusal, got {refused:?}"
+            "expected a held-op refusal, got {refused:?}"
+        );
+    }
+
+    /// An install below the head keeps the head, and an offer at or below the
+    /// known commit keeps the commit point, so only the journal wipe can tell a
+    /// suffix snapshot taken before the install that the bodies it offers are
+    /// gone.
+    #[compio::test]
+    async fn given_a_suffix_snapshot_when_an_install_keeps_the_head_should_invalidate_it() {
+        const HEAD: u64 = 3;
+        let (_directory, mut receiver) = transfer_receiver();
+        receiver.consensus().sequencer().set_sequence(HEAD);
+        receiver.consensus().advance_commit_max(HEAD);
+        receiver
+            .consensus()
+            .set_local_dvc_suffix(consensus::DvcSuffix::empty());
+        assert!(!receiver.consensus().local_dvc_suffix_stale());
+        let offsets = crate::state_transfer::ConsumerOffsetsWire {
+            dedup_capacity: consensus::CLIENTS_TABLE_MAX,
+            ..Default::default()
+        };
+
+        let installed = receiver
+            .install_state_transfer(&repair_config(), 1, Vec::new(), &offsets.encode())
+            .await;
+
+        assert!(
+            installed.is_ok(),
+            "the offer erases no held op, got {installed:?}"
+        );
+        assert_eq!(receiver.consensus().sequencer().current_sequence(), HEAD);
+        assert!(
+            receiver.consensus().local_dvc_suffix_stale(),
+            "a suffix snapshot taken before the install still matches the log, so the \
+             next DoViewChange offers bodies the install wiped"
         );
     }
 
@@ -17536,7 +17571,7 @@ mod tests {
             matches!(
                 installed,
                 Err(
-                    crate::state_transfer::PartitionInstallError::StaleTransfer {
+                    crate::state_transfer::PartitionInstallError::OfferErasesHeldOps {
                         commit_op: 1,
                         ..
                     }
@@ -17710,7 +17745,9 @@ mod tests {
             .await
             .unwrap();
         backup.drive_persistence().await;
-        backup.consensus().advance_commit_max(1);
+        // Op 3 is committed but unacked here: the WAL hole at op 2 holds back
+        // its ack, so it must not block the install.
+        backup.consensus().advance_commit_max(3);
         let third = checksummed_segment_prepare(3, 0, 2, b"unacked");
         let header = *third.header();
         backup
@@ -26046,6 +26083,132 @@ mod tests {
         assert!(reopened.consensus().view_log_unproven());
         assert!(!reopened.consensus().view_log_entry_proven(HEAD));
         assert!(!reopened.register_rebuilt_ack(&headers[0]));
+    }
+
+    /// An install below the head of an adopted `StartView` leaves the WAL without
+    /// that view's log. A restart before repair must restore the adopted head, or
+    /// the replica votes for the view with a head at the install op.
+    #[compio::test]
+    async fn given_an_install_below_the_adopted_head_when_reopening_should_resume_the_adopted_view()
+    {
+        const BACKUP: u8 = 1;
+        const ADOPTED: u32 = 2;
+        const HELD: u64 = 1;
+        const HEAD: u64 = 3;
+        let directory = tempfile::tempdir().unwrap();
+        let (config, mut partition) = replica_with_prepare_history(directory.path(), BACKUP).await;
+        let partition_dir = config.get_partition_path(1, 1, 0);
+        let store = Rc::new(PingPongSuperblock::open(&partition_dir).await.unwrap());
+        partition.set_superblock(store.clone(), None);
+        let held = checksummed_segment_prepare(HELD, 0, 0, b"retained");
+        partition.on_replicate(held.clone()).await;
+        let persistence = partition.persistence.as_ref().unwrap().clone();
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
+        let mut parent = *held.header();
+        let mut headers = Vec::new();
+        for op in HELD + 1..=HEAD {
+            let mut header = PrepareHeader {
+                op,
+                request: op,
+                timestamp: op,
+                view: ADOPTED,
+                parent: parent.checksum,
+                ..parent
+            };
+            header.checksum = header.identity_checksum();
+            parent = header;
+            headers.push(header);
+        }
+        headers.reverse();
+        let start_view = Message::<iggy_binary_protocol::StartViewHeader>::new(size_of::<
+            iggy_binary_protocol::StartViewHeader,
+        >())
+        .transmute_header(|_, header: &mut iggy_binary_protocol::StartViewHeader| {
+            header.command = Command::StartView;
+            header.cluster = TEST_CLUSTER;
+            header.group = partition.namespace().inner();
+            header.view = ADOPTED;
+            header.replica = 2;
+            header.op = HEAD;
+            header.commit = HEAD - 1;
+            header.size =
+                u32::try_from(size_of::<iggy_binary_protocol::StartViewHeader>()).unwrap();
+        });
+        partition.consensus().handle_start_view(
+            consensus::PlaneKind::Partitions,
+            start_view.header(),
+            bytemuck::cast_slice(&headers),
+        );
+        assert!(partition.persist_superblock_if_needed().await);
+
+        let body = held.as_slice()[size_of::<PrepareHeader>()..].to_vec();
+        let artifact = consensus::StateArtifact::for_bytes(
+            consensus::state_manifest::artifact_kind::SEGMENT_LOG,
+            0,
+            &body,
+        );
+        let staged = partition
+            .spill_transfer_segment(&artifact, body)
+            .await
+            .unwrap();
+        let offsets = crate::state_transfer::ConsumerOffsetsWire {
+            dedup_capacity: consensus::CLIENTS_TABLE_MAX,
+            prepare_checksum: Some(held.header().checksum),
+            checkpoint_prepare: held.as_slice().to_vec(),
+            next_offset: 1,
+            ..Default::default()
+        };
+        partition.consensus().begin_state_transfer_await();
+        partition
+            .install_state_transfer(&repair_config(), HELD, vec![staged], &offsets.encode())
+            .await
+            .unwrap();
+        assert_eq!(partition.consensus().sequencer().current_sequence(), HEAD);
+        assert!(partition.consensus().view_log_unproven());
+        let certified_after_install = persistence.certified_log_view();
+        let segment_size = partition.log.active_segment().max_size;
+        drop(persistence);
+        drop(partition);
+        drop(store);
+
+        let (store, latest) = PingPongSuperblock::open_with_latest(&partition_dir)
+            .await
+            .unwrap();
+        let journal::superblock::SuperblockContents::Present(bytes) = latest else {
+            panic!("adopted record must be durable");
+        };
+        let state = consensus::VsrState::try_from(bytes.as_slice()).unwrap();
+        let (mut reopened, _) = recording_partition_at(BACKUP, 3);
+        reopened.consensus.set_view(state.view);
+        reopened.consensus.set_log_view(state.log_view);
+        reopened
+            .consensus
+            .mark_superblock_durable(state.view, state.log_view);
+        reopened.set_superblock(Rc::new(store), Some(&state));
+        reopened.set_partition_dir(partition_dir);
+        reopened.log.active_segment_mut().max_size = segment_size;
+        reopened.open_persistence().await.unwrap();
+        assert!(
+            !reopened.requires_state_transfer(),
+            "the certificate after the install is below the persisted log view"
+        );
+        assert_eq!(
+            reopened.consensus().adopted_view_head(),
+            Some((ADOPTED, HEAD))
+        );
+        assert_eq!(
+            (
+                reopened.consensus().sequencer().current_sequence(),
+                reopened.consensus().view_log_unproven(),
+            ),
+            (HEAD, true),
+            "the restart dropped the adopted head: certified view after the install \
+             {certified_after_install:?}, state log_view {}",
+            state.log_view
+        );
     }
 
     /// The WAL drops a divergent run before the journal does. The canonical
